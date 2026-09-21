@@ -1,5 +1,5 @@
 // Trade Book service worker: keeps the app working offline. It never touches price requests.
-const V = 'tradebook-v2';
+const V = 'tradebook-v3';
 const SHELL = ['./', 'index.html', 'companies.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {

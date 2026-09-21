@@ -228,6 +228,10 @@ td{padding:9px 12px;border-top:1px solid var(--line);text-align:right}
 .gate p{color:var(--ink2);margin-bottom:14px}
 .gate .btn{width:100%;margin-top:16px}
 .gate .link{margin-top:10px}
+.steps{padding:0 18px 0 38px;font-size:14px;color:var(--ink2)}
+.steps li{margin:9px 0}
+.steps b{color:var(--ink);font-weight:600}
+.steps code{background:var(--s2);border-radius:6px;padding:1px 6px;font-size:13px;color:var(--ink)}
 @media (prefers-reduced-motion: reduce){.pane{animation:none}#toast{transition:none}.chev{transition:none}}
 </style>
 </head>
@@ -427,15 +431,16 @@ const IDX=buildIndex(window.CO_DATA);
 let DB=null,KEY=null,SALT=null;
 let page='home',pnlMode='month',brokerF='all',bookF={q:'',r:'all'};
 let refreshing=false,shellBuilt=false,hiddenAt=0,saveT=0,feedLog=null;
+let syncing=false,needSync=false,lastCanon='',syncKeyCache=null,syncT=0,syncMode='first',joinResolve=null;
 const expanded=new Set(),buysOpen=new Set();
 
 function defaultDB(){
   return {v:2,
     settings:{capital:0,riskPerTrade:1000,nearPct:1,autoLock:60,source:'yahoo',customUrl:'',defaultBroker:'groww',
-      brokers:{groww:{charges:{...GROWW_CHARGES}},zerodha:{charges:{...ZERODHA_CHARGES}}},lastBackup:0},
+      brokers:{groww:{charges:{...GROWW_CHARGES}},zerodha:{charges:{...ZERODHA_CHARGES}}},lastBackup:0,sync:{on:false}},
     tags:{setups:['Knoxville Divergence','Breakout','Pullback','Support bounce','Other'],
           mistakes:['Moved stop-loss','Exited early','Chased entry','Oversized','No stop-loss','Held too long','Ignored plan']},
-    trades:[],prices:{},alertLog:{}};
+    trades:[],prices:{},alertLog:{},deleted:{},meta:{settingsAt:0,tagsAt:0}};
 }
 const yfOf=t=>t.sym+(t.ex==='BSE'?'.BO':'.NS');
 function syncTrade(t){
@@ -444,8 +449,19 @@ function syncTrade(t){
   t.entry=Math.round(avgOf(bs)*10000)/10000;
   t.entryDate=bs.map(b=>b.date).sort()[0];
 }
+function fixTrade(t,S){
+  t.exits=t.exits||[];
+  if(!t.buys||!t.buys.length) t.buys=[{id:uid(),date:t.entryDate,price:t.entry,qty:t.qty}];
+  t.buys.forEach(x=>{if(!x.id)x.id=uid();});
+  t.broker=t.broker||S.defaultBroker;t.name=t.name||'';
+  if(!t.yf) t.yf=yfOf(t);
+  if(!t.u) t.u=Date.now();
+  syncTrade(t);return t;
+}
 function migrate(d){
-  const b=defaultDB(),S=d.settings=Object.assign({},b.settings,d.settings||{});
+  const b=defaultDB();
+  d.settings=d.settings||{};const S=d.settings;
+  Object.keys(b.settings).forEach(k=>{if(S[k]===undefined)S[k]=b.settings[k];});
   const old=S.charges;delete S.charges;
   S.brokers=S.brokers||{};
   ['groww','zerodha'].forEach(k=>{
@@ -454,15 +470,9 @@ function migrate(d){
     S.brokers[k].charges=Object.assign({},base,(k==='groww'&&old)?old:{},S.brokers[k].charges||{});
   });
   d.tags=Object.assign({},b.tags,d.tags||{});
-  d.trades=d.trades||[];d.prices=d.prices||{};d.alertLog=d.alertLog||{};
-  d.trades.forEach(t=>{
-    t.exits=t.exits||[];
-    if(!t.buys||!t.buys.length) t.buys=[{id:uid(),date:t.entryDate,price:t.entry,qty:t.qty}];
-    t.buys.forEach(x=>{if(!x.id)x.id=uid();});
-    t.broker=t.broker||S.defaultBroker;t.name=t.name||'';
-    if(!t.yf) t.yf=yfOf(t);
-    syncTrade(t);
-  });
+  d.trades=d.trades||[];d.prices=d.prices||{};d.alertLog=d.alertLog||{};d.deleted=d.deleted||{};
+  d.meta=Object.assign({settingsAt:0,tagsAt:0},d.meta||{});
+  d.trades.forEach(t=>fixTrade(t,S));
   d.v=2;return d;
 }
 const pkey=t=>t.yf||yfOf(t);
@@ -489,10 +499,11 @@ async function decryptJSON(p,key){
   return JSON.parse(dec.decode(pt));
 }
 const vaultExists=()=>!!localStorage.getItem(VAULT);
-async function saveVault(){
+async function saveVault(quiet){
   if(!DB||!KEY) return;
   const p=await encryptJSON(DB,KEY);
   localStorage.setItem(VAULT,JSON.stringify({v:1,iter:ITER,salt:b64(SALT),iv:p.iv,ct:p.ct}));
+  if(!quiet&&syncOn()) syncSoon();
 }
 function persistSoon(){clearTimeout(saveT);saveT=setTimeout(()=>saveVault().catch(()=>{}),400);}
 async function createVault(pin,data){
@@ -508,7 +519,7 @@ async function unlock(pin){
   try{DB=migrate(await decryptJSON(raw,key));}catch(e){return false;}
   KEY=key;SALT=salt;return true;
 }
-function lock(){DB=null;KEY=null;SALT=null;shellBuilt=false;page='home';expanded.clear();buysOpen.clear();closeSheet();render();}
+function lock(){DB=null;KEY=null;SALT=null;lastCanon='';syncKeyCache=null;shellBuilt=false;page='home';expanded.clear();buysOpen.clear();closeSheet();render();}
 
 /* ---------- prices (free delayed source, with a live check of each symbol) ---------- */
 const YQ=sym=>'https://query1.finance.yahoo.com/v8/finance/chart/'+encodeURIComponent(sym)+'?interval=1m&range=1d';
@@ -721,6 +732,8 @@ function viewHome(){
   h+='<div class="sumnote">'+open.length+' open '+(open.length===1?'trade':'trades')+', '+rs(risk,0)+' at risk</div></section>';
   const alerts=computeAlerts();
   if(alerts.length) h+='<div class="note" role="alert">'+alerts.slice(0,3).map(a=>'<p>'+esc(a.msg)+'</p>').join('')+'</div>';
+  const ss=DB.settings.sync;
+  if(ss&&ss.on&&ss.err) h+='<div class="note">Sync problem: '+esc(ss.err)+' <button class="link" data-act="go" data-p="sync">Details</button></div>';
   const lb=DB.settings.lastBackup;
   if(DB.trades.length&&Date.now()-lb>7*86400000)
     h+='<div class="note">'+(lb?'Your last backup is over a week old.':'You have not saved a backup yet.')+' <button class="link" data-act="backup">Save backup</button></div>';
@@ -736,8 +749,8 @@ function viewMore(){
   const item=(p,l,s)=>'<button class="mi" data-act="go" data-p="'+p+'"><span>'+l+'</span>'+(s?'<small>'+s+'</small>':'')+'</button>';
   return '<section class="card menu"><button class="mi" data-act="lock"><span>Lock now</span></button></section>'+
     '<section class="card menu">'+item('closed','Closed trades',n?n+' trades':'')+item('pnl','Profit and loss','daily, weekly, monthly')+'</section>'+
-    '<section class="card menu">'+item('look','Appearance',{dark:'Calm Dark',light:'Calm Light',auto:'Follow phone'}[LOOK.theme])+item('brokers','Brokers and charges',BROKERS[DB.settings.defaultBroker])+item('prices','Prices','')+item('tags','Tags','')+item('backup','Backup and export','')+item('security','Security and risk','')+'</section>'+
-    '<p class="hint" style="text-align:center">Trade Book v2</p>';
+    '<section class="card menu">'+item('look','Appearance',{dark:'Calm Dark',light:'Calm Light',auto:'Follow phone'}[LOOK.theme])+item('brokers','Brokers and charges',BROKERS[DB.settings.defaultBroker])+item('prices','Prices','')+item('tags','Tags','')+item('sync','Sync between devices',syncLabel())+item('backup','Backup and export','')+item('security','Security and risk','')+'</section>'+
+    '<p class="hint" style="text-align:center">Trade Book v2.1</p>';
 }
 function brokerChips(){
   if(brokersUsed().length<2) return '';
@@ -840,7 +853,7 @@ function viewTags(){
 function viewBackup(){
   const lb=DB.settings.lastBackup,d=lb?new Date(lb):null;
   return '<p class="hint" style="padding-top:8px">Last backup: '+(d?dFull(d.getFullYear()+'-'+pad2(d.getMonth()+1)+'-'+pad2(d.getDate())):'never')+'</p><div class="btnrow"><button class="btn pri" data-act="backup">Save encrypted backup</button><button class="btn" data-act="restore">Restore from a backup</button><button class="btn" data-act="csv">Export trade book (CSV, not encrypted)</button></div>'+
-    '<p class="hint">A backup is encrypted with your PIN. If Chrome data is cleared or you forget the PIN, it is the only way back.</p>';
+    '<p class="hint">A backup is encrypted with your PIN. If Chrome data is cleared or you forget the PIN, it is the only way back. Sync is not a backup: it copies your deletions too.</p>';
 }
 function viewSecurity(){
   const S=DB.settings;
@@ -849,7 +862,243 @@ function viewSecurity(){
     '<p class="hint">“Risk per trade” is the most you are willing to lose if the stop-loss hits. It is used only to suggest a quantity. Alerts show while the app is open.</p>'+
     '<div class="sec"><h2>Danger zone</h2></div><div class="btnrow"><button class="btn danger" data-act="erase">Erase everything on this phone</button></div>';
 }
-const PAGES={more:['More',viewMore],closed:['Closed trades',viewClosed],pnl:['Profit and loss',viewPnl],look:['Appearance',viewLook],brokers:['Brokers and charges',viewBrokers],prices:['Prices',viewPrices],tags:['Tags',viewTags],backup:['Backup and export',viewBackup],security:['Security and risk',viewSecurity]};
+const PAGES={more:['More',viewMore],closed:['Closed trades',viewClosed],pnl:['Profit and loss',viewPnl],look:['Appearance',viewLook],brokers:['Brokers and charges',viewBrokers],prices:['Prices',viewPrices],tags:['Tags',viewTags],backup:['Backup and export',viewBackup],sync:['Sync between devices',viewSync],security:['Security and risk',viewSecurity]};
+
+/* ---------- sync through a private GitHub repository (encrypted before it leaves this device) ---------- */
+const GHAPI='https://api.github.com',SYNCFILE='tradebook.tbk';
+const syncOn=()=>!!(DB&&DB.settings.sync&&DB.settings.sync.on);
+function canon(v){
+  if(Array.isArray(v)) return '['+v.map(canon).join(',')+']';
+  if(v&&typeof v==='object') return '{'+Object.keys(v).sort().filter(k=>v[k]!==undefined).map(k=>JSON.stringify(k)+':'+canon(v[k])).join(',')+'}';
+  return JSON.stringify(v)||'null';
+}
+const byId=(a,b)=>a.id<b.id?-1:a.id>b.id?1:0;
+function syncPayload(){
+  const S=DB.settings;
+  return {v:1,trades:DB.trades.slice().sort(byId),deleted:DB.deleted,
+    tags:{at:DB.meta.tagsAt,setups:DB.tags.setups,mistakes:DB.tags.mistakes},
+    settings:{at:DB.meta.settingsAt,capital:S.capital,riskPerTrade:S.riskPerTrade,nearPct:S.nearPct,defaultBroker:S.defaultBroker,brokers:S.brokers}};
+}
+function mergePayloads(L,R){
+  const del={};
+  [L.deleted||{},R.deleted||{}].forEach(d=>{for(const k in d) del[k]=Math.max(del[k]||0,d[k]);});
+  const map={};
+  [R.trades||[],L.trades||[]].forEach(list=>list.forEach(t=>{const c=map[t.id];if(!c||(t.u||0)>(c.u||0))map[t.id]=t;}));
+  const trades=[];
+  for(const id in map){
+    const t=map[id];
+    if(del[id]&&del[id]>=(t.u||0)) continue;
+    if(del[id]) delete del[id];
+    trades.push(t);
+  }
+  const newer=(a,b)=>((b&&b.at||0)>(a&&a.at||0))?b:a;
+  return {v:1,trades:trades.sort(byId),deleted:del,tags:newer(L.tags,R.tags),settings:newer(L.settings,R.settings)};
+}
+function applyPayload(p){
+  const S=DB.settings;
+  DB.trades=JSON.parse(JSON.stringify(p.trades||[]));
+  DB.deleted=Object.assign({},p.deleted||{});
+  if(p.tags){DB.tags.setups=p.tags.setups||DB.tags.setups;DB.tags.mistakes=p.tags.mistakes||DB.tags.mistakes;DB.meta.tagsAt=p.tags.at||0;}
+  if(p.settings){
+    ['capital','riskPerTrade','nearPct','defaultBroker'].forEach(k=>{if(p.settings[k]!==undefined)S[k]=p.settings[k];});
+    if(p.settings.brokers) S.brokers=JSON.parse(JSON.stringify(p.settings.brokers));
+    DB.meta.settingsAt=p.settings.at||0;
+  }
+  migrate(DB);
+}
+function fr(m){const e=new Error(m);e.friendly=m;return e;}
+function netMsg(e){
+  if(e&&e.friendly) return e.friendly;
+  if(/Failed to fetch|abort|NetworkError|Load failed/i.test(String(e&&(e.name+' '+e.message)))) return 'Could not reach GitHub. Your changes are saved here and will sync when you are online.';
+  return String(e&&e.message||e);
+}
+async function ghReq(method,path,body){
+  const s=DB.settings.sync,c=new AbortController(),id=setTimeout(()=>c.abort(),15000);
+  try{
+    return await fetch(GHAPI+path,{method,cache:'no-store',signal:c.signal,
+      headers:Object.assign({Authorization:'Bearer '+s.token,Accept:'application/vnd.github+json'},body?{'Content-Type':'application/json'}:{}),
+      body:body?JSON.stringify(body):undefined});
+  }finally{clearTimeout(id);}
+}
+async function ghJson(r){try{return await r.json();}catch(e){return {};}}
+function ghError(r,j){
+  const m=j&&j.message?String(j.message):'';
+  if(r.status===401) return 'GitHub rejected the token. It may have expired. Create a new token and use Replace token.';
+  if(r.status===403) return /rate limit/i.test(m)?'GitHub rate limit reached. It will try again later.':'The token cannot write to this repository. It needs Contents set to Read and write.';
+  if(r.status===404) return 'Repository not found, or the token has no access to it.';
+  return 'GitHub said: '+(m||('HTTP '+r.status));
+}
+const syncPath=()=>'/repos/'+DB.settings.sync.repo+'/contents/'+SYNCFILE;
+async function ghGetFile(){
+  const r=await ghReq('GET',syncPath());
+  if(r.status===404) return null;
+  const j=await ghJson(r);
+  if(!r.ok) throw fr(ghError(r,j));
+  if(j.encoding!=='base64'||typeof j.content!=='string') throw fr('The sync file could not be read. It may be too large.');
+  return {sha:j.sha,text:atob(j.content.replace(/\s/g,''))};
+}
+async function ghPutFile(text,sha){
+  const body={message:'Trade Book sync',content:btoa(text)};if(sha) body.sha=sha;
+  const r=await ghReq('PUT',syncPath(),body);
+  if(r.status===409||r.status===422){const e=new Error('conflict');e.conflict=true;throw e;}
+  if(!r.ok) throw fr(ghError(r,await ghJson(r)));
+}
+async function syncKey(saltB64,iter,pass){
+  const id=saltB64+'|'+iter+'|'+pass;
+  if(syncKeyCache&&syncKeyCache.id===id) return syncKeyCache.key;
+  const key=await deriveKey(pass,unb64(saltB64),iter);
+  syncKeyCache={id,key};return key;
+}
+async function syncNow(manual){
+  if(!syncOn()) return;
+  if(syncing){if(manual)toast('Sync is already running.');return;}
+  if(sheetOpen){needSync=true;if(manual)toast('Close this window first, then sync.');return;}
+  syncing=true;updateSyncBits();
+  const db=DB;let changed=false,err='';
+  try{
+    let done=false;
+    for(let attempt=0;attempt<4&&!done;attempt++){
+      const S=db.settings.sync,snap=canon(syncPayload());
+      const file=await ghGetFile();
+      let remote=null,env=null,key=null;
+      if(file){
+        try{env=JSON.parse(file.text);}catch(e){throw fr('The sync file on GitHub is damaged.');}
+        key=await syncKey(env.salt,env.iter||ITER,S.pass);
+        try{remote=await decryptJSON(env,key);}catch(e){throw fr('The sync password does not match the one used to start sync.');}
+      }
+      if(DB!==db) return;
+      if(sheetOpen){needSync=true;return;}
+      const local=syncPayload();
+      if(canon(local)!==snap) continue;
+      const merged=remote?mergePayloads(local,remote):local,mc=canon(merged);
+      if(remote&&mc!==canon(local)){applyPayload(merged);changed=true;await saveVault(true);}
+      if(!remote||mc!==canon(remote)){
+        let k=key,saltB=env&&env.salt;const iter=env?(env.iter||ITER):ITER;
+        if(!env){saltB=b64(crypto.getRandomValues(new Uint8Array(16)));k=await syncKey(saltB,iter,S.pass);}
+        const e=await encryptJSON(merged,k);
+        try{await ghPutFile(JSON.stringify({v:1,kind:'tradebook-sync',iter,salt:saltB,iv:e.iv,ct:e.ct}),file&&file.sha);}
+        catch(x){if(x.conflict) continue;throw x;}
+      }
+      lastCanon=mc;done=true;
+    }
+    if(!done) throw fr('Sync kept clashing with another device. It will try again shortly.');
+    const s2=db.settings.sync;s2.last=Date.now();s2.err='';
+    await saveVault(true);
+  }catch(e){
+    err=netMsg(e);
+    if(db.settings.sync) db.settings.sync.err=err;
+    try{await saveVault(true);}catch(x){}
+  }finally{
+    syncing=false;
+  }
+  if(DB===db){
+    if(changed&&!sheetOpen) renderMain();
+    updateSyncBits();
+    if(manual) toast(err?'Sync problem: '+err:'Synced.');
+  }
+}
+function syncSoon(ms,force){
+  clearTimeout(syncT);
+  syncT=setTimeout(()=>{if(syncOn()&&(force||canon(syncPayload())!==lastCanon))syncNow();},ms==null?2500:ms);
+}
+function updateSyncBits(){
+  if(!DB) return;
+  if(page==='sync'&&!(document.activeElement&&document.activeElement.tagName==='INPUT')) renderMain();
+  else if(page==='home') renderMain();
+}
+function askJoin(nLocal,nRemote){
+  return new Promise(res=>{
+    joinResolve=res;
+    openSheet('<h2>This device already has trades</h2><p class="muted">This device has '+nLocal+' '+(nLocal===1?'trade':'trades')+' and the synced copy has '+nRemote+'.</p>'+
+      '<p style="margin-top:12px"><b>Replace</b> makes this device show exactly the synced copy. Choose it if these are the same trades you entered twice. A backup of this device’s current data is saved first.</p>'+
+      '<p style="margin-top:10px"><b>Merge</b> keeps both sets. The same trade can then appear twice.</p>'+
+      '<div class="actions" style="flex-direction:column"><button class="btn pri" data-act="joinreplace">Replace with the synced copy</button><button class="btn" data-act="joinmerge">Merge both</button><button class="btn" data-act="closesheet">Cancel</button></div>');
+  });
+}
+async function syncConnect(btn){
+  const err=$('#sy-err');err.textContent='';
+  const repo=$('#sy-repo').value.trim().replace(/^https?:\/\/github\.com\//,'').replace(/\.git$/,'').replace(/\/+$/,'');
+  const token=$('#sy-token').value.trim(),pass=$('#sy-pass').value;
+  const bad=m=>{err.textContent=m;};
+  if(!/^[\w.-]+\/[\w.-]+$/.test(repo)) return bad('Enter the repository as owner/name, for example As-if-Hub/tradebook-data.');
+  if(token.length<20) return bad('Paste the access token from GitHub.');
+  if(pass.length<8) return bad('Use a sync password of at least 8 characters.');
+  if(syncMode==='first'&&pass!==$('#sy-pass2').value) return bad('The two sync passwords do not match.');
+  const label=btn.textContent;btn.disabled=true;btn.textContent='Connecting…';
+  const prev=DB.settings.sync;
+  DB.settings.sync={on:false,repo,token,pass};
+  try{
+    const r=await ghReq('GET','/repos/'+repo),j=await ghJson(r);
+    if(!r.ok) throw fr(ghError(r,j));
+    if(j.private!==true) throw fr('This repository is public. Create a private one so your encrypted data is not exposed.');
+    if(j.permissions&&j.permissions.push===false) throw fr('This token can only read the repository. Give it Contents: Read and write.');
+    const file=await ghGetFile();
+    let adopt=null;
+    if(syncMode==='first'){
+      if(file) throw fr('Sync data already exists in this repository. Use “Other device” to connect to it.');
+    }else{
+      if(!file) throw fr('No synced data was found in this repository yet. Start sync on your first device first.');
+      let env,remote;
+      try{env=JSON.parse(file.text);remote=await decryptJSON(env,await syncKey(env.salt,env.iter||ITER,pass));}
+      catch(e){throw fr('That sync password does not match this repository.');}
+      if(DB.trades.length>0){
+        const choice=await askJoin(DB.trades.length,(remote.trades||[]).length);
+        if(!choice) throw fr('Cancelled. Nothing was changed.');
+        if(choice==='replace'){
+          await saveVault(true);
+          download('tradebook-before-sync-'+today()+'.tbk',localStorage.getItem(VAULT),'application/json');
+          adopt=remote;
+        }
+      }
+    }
+    if(adopt){
+      applyPayload(adopt);lastCanon=canon(syncPayload());
+      DB.settings.sync={on:true,repo,token,pass,last:Date.now(),err:''};
+      await saveVault(true);
+    }else{
+      DB.settings.sync={on:true,repo,token,pass,last:0,err:''};
+      await saveVault(true);
+      await syncNow(true);
+      const e2=DB.settings.sync.err;
+      if(e2) throw fr(e2);
+    }
+    toast('Sync is on.');renderMain();
+  }catch(e){
+    DB.settings.sync=prev||{on:false};
+    await saveVault(true);
+    const m=netMsg(e);
+    if($('#sy-err')) $('#sy-err').textContent=m;
+    btn.disabled=false;btn.textContent=label;
+    return;
+  }
+}
+function syncLabel(){const s=DB.settings.sync||{};return s.on?(s.err?'problem':'on'):'off';}
+function viewSync(){
+  const s=DB.settings.sync||{};
+  if(s.on){
+    let when='not yet';
+    if(s.last){const d=new Date(s.last),same=today()===d.getFullYear()+'-'+pad2(d.getMonth()+1)+'-'+pad2(d.getDate());when=(same?'today':d.getDate()+' '+MON[d.getMonth()])+' at '+hm(s.last);}
+    return '<section class="card"><div class="det" style="border:0"><div class="kv"><span>Status</span><span class="'+(syncing?'':s.err?'loss':'gain')+'">'+(syncing?'Syncing…':s.err?'Problem':'On')+'</span><span>Repository</span><span>'+esc(s.repo)+'</span><span>Last synced</span><span>'+esc(when)+'</span></div>'+(s.err?'<div class="hint2">'+esc(s.err)+'</div>':'')+'</div></section>'+
+      '<div class="btnrow"><button class="btn pri" data-act="syncnow"'+(syncing?' disabled':'')+'>Sync now</button></div>'+
+      '<p class="hint">It also syncs by itself when you open the app, when you change something, and every couple of minutes while it is open. If two devices change the same trade, the newest edit wins, so keep your phone and computer clocks correct.</p>'+
+      '<div class="sec"><h2>Replace token</h2><p>Use this when GitHub says the token expired.</p></div><div class="setrow"><label for="sy-newtoken">New token</label><input id="sy-newtoken" type="password" autocomplete="off" autocapitalize="none" spellcheck="false"><div class="btnrow" style="padding:10px 0 0"><button class="btn" data-act="synctoken">Save new token</button></div></div>'+
+      '<p class="hint">Prices and your PIN are never synced. Backups from this device include the sync details, encrypted with your PIN.</p>'+
+      '<div class="btnrow"><button class="btn danger" data-act="syncoff">Turn off sync on this device</button></div>';
+  }
+  return '<div class="hint" style="padding-top:8px">Keep your trades the same on your phone and computer. Everything is encrypted on this device before it is uploaded, so GitHub only stores scrambled text.</div>'+
+    '<div class="sec"><h2>One-time setup on github.com</h2></div><ol class="steps">'+
+    '<li>Tap <b>+</b>, then <b>New repository</b>. Name it <code>tradebook-data</code>, choose <b>Private</b>, tick <b>Add a README file</b>, then <b>Create repository</b>.</li>'+
+    '<li>Tap your profile picture, then <b>Settings</b>, <b>Developer settings</b> (near the bottom of the menu), <b>Personal access tokens</b>, <b>Fine-grained tokens</b>, <b>Generate new token</b>.</li>'+
+    '<li>Name it Trade Book and choose the longest expiry offered. Under <b>Repository access</b> pick <b>Only select repositories</b> and choose <code>tradebook-data</code>. Under <b>Permissions</b>, <b>Repository permissions</b>, set <b>Contents</b> to <b>Read and write</b>. Tap <b>Generate token</b> and copy it.</li>'+
+    '<li>Fill in the form below. Use <b>First device</b> on the device that has your trades. On every other device use <b>Other device</b> with the same repository, token and sync password.</li></ol>'+
+    '<div class="tog" style="margin-top:12px"><button data-act="syncmode" data-v="first" aria-pressed="'+(syncMode==='first')+'">First device</button><button data-act="syncmode" data-v="other" aria-pressed="'+(syncMode==='other')+'">Other device</button></div>'+
+    '<div class="setrow"><label for="sy-repo">Repository (owner/name)</label><input id="sy-repo" placeholder="your-username/tradebook-data" autocapitalize="none" spellcheck="false" autocomplete="off">'+
+    '<label for="sy-token">Access token</label><input id="sy-token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false">'+
+    '<label for="sy-pass">Sync password (at least 8 characters)</label><input id="sy-pass" type="password" autocomplete="off">'+
+    '<div id="sy-pass2w"'+(syncMode==='first'?'':' hidden')+'><label for="sy-pass2">Sync password again</label><input id="sy-pass2" type="password" autocomplete="off"></div>'+
+    '<p class="hint" style="padding:8px 0 0">The sync password encrypts your data on GitHub. It is separate from your PIN and cannot be recovered, so keep it somewhere safe.</p>'+
+    '<p class="err" id="sy-err" role="alert"></p><div class="btnrow" style="padding:8px 0 0"><button class="btn pri" data-act="syncconnect">'+(syncMode==='first'?'Start sync':'Connect this device')+'</button></div></div>';
+}
 
 /* ---------- shell, router, gates ---------- */
 function buildShell(){
@@ -916,7 +1165,7 @@ async function onGate(e){
     btn.disabled=true;await createVault(pin);btn.disabled=false;afterUnlock();
   }
 }
-function afterUnlock(){page='home';render();refreshPrices();}
+function afterUnlock(){page='home';render();refreshPrices();syncNow();}
 
 /* ---------- sheets ---------- */
 let sheetOpen=false;
@@ -932,10 +1181,12 @@ function openSheet(html){
 }
 function closeSheet(){
   const was=sheetOpen;sheetOpen=false;clearSheet();
+  if(joinResolve){const r=joinResolve;joinResolve=null;r(null);}
   if(was){try{if(history.state&&history.state.sheet)history.back();}catch(e){}}
+  if(needSync){needSync=false;syncSoon(600,true);}
 }
 window.addEventListener('popstate',e=>{
-  if(sheetOpen){sheetOpen=false;clearSheet();return;}
+  if(sheetOpen){sheetOpen=false;clearSheet();if(joinResolve){const r=joinResolve;joinResolve=null;r(null);}if(needSync){needSync=false;syncSoon(600,true);}return;}
   const p=(e.state&&e.state.p)||'home';
   if(DB&&p!==page){page=p;renderMain();}
 });
@@ -1076,11 +1327,11 @@ async function saveTrade(f,t,getPick){
   if(e.length){err.textContent=e[0];return;}
   const fields={ex:pick.ex,sym:pick.sym,name:pick.n||'',yf:pick.yf,broker:v.broker,sl:v.sl,tgt:v.tgt,setup:v.setup,notes:v.notes};
   if(t){
-    Object.assign(t,fields);
+    Object.assign(t,fields);t.u=Date.now();
     if(!multi){t.buys[0].price=v.entry;t.buys[0].qty=v.qty;t.buys[0].date=v.date;}
     syncTrade(t);
   }else{
-    const nt={id:uid(),...fields,exits:[],buys:[{id:uid(),date:v.date,price:v.entry,qty:v.qty}]};
+    const nt={id:uid(),u:Date.now(),...fields,exits:[],buys:[{id:uid(),date:v.date,price:v.entry,qty:v.qty}]};
     syncTrade(nt);DB.trades.push(nt);
   }
   await saveVault();
@@ -1117,7 +1368,7 @@ function buySheet(tid,bid){
       const sl=f.elements.sl?num(f.elements.sl.value):NaN,tg=f.elements.tgt?num(f.elements.tgt.value):NaN;
       if(sl>0)t.sl=sl;if(tg>0)t.tgt=tg;
     }
-    syncTrade(t);
+    syncTrade(t);t.u=Date.now();
     try{await saveVault();}catch(x){err.textContent='Could not save: '+x.message;return;}
     closeSheet();toast(b?'Buy updated':'Shares added');expanded.add(t.id);renderMain();
   });
@@ -1152,6 +1403,7 @@ function exitSheet(tid,eid){
     if(!date||date<t.entryDate||date>today()){err.textContent='Pick a date between the entry date and today.';return;}
     const rec={id:ex?ex.id:uid(),date,price,qty,reason:f.elements.reason.value,mistakes:$$('input[name=mk]:checked',f).map(x=>x.value),note:f.elements.note.value.trim()};
     if(ex) t.exits[t.exits.findIndex(x=>x.id===eid)]=rec;else t.exits.push(rec);
+    t.u=Date.now();
     try{await saveVault();}catch(x){err.textContent='Could not save: '+x.message;return;}
     closeSheet();toast(qty>=maxQ?'Trade closed':'Partial exit logged');renderMain();
   });
@@ -1257,13 +1509,13 @@ document.addEventListener('click',async e=>{
       case 'delbuy':{
         const t=findTrade(id),b=t.buys.find(x=>x.id===el.dataset.bid),sold=t.exits.reduce((s,x)=>s+x.qty,0);
         if(t.qty-b.qty<sold){toast('That would leave fewer shares than the '+sold+' already sold.');break;}
-        if(confirm('Delete this buy?')){t.buys=t.buys.filter(x=>x.id!==b.id);syncTrade(t);await saveVault();detailSheet(id);renderMain();}
+        if(confirm('Delete this buy?')){t.buys=t.buys.filter(x=>x.id!==b.id);syncTrade(t);t.u=Date.now();await saveVault();detailSheet(id);renderMain();}
         break;}
       case 'editexit':exitSheet(id,el.dataset.eid);break;
-      case 'delexit':if(confirm('Delete this exit?')){const t=findTrade(id);t.exits=t.exits.filter(x=>x.id!==el.dataset.eid);await saveVault();detailSheet(id);renderMain();}break;
+      case 'delexit':if(confirm('Delete this exit?')){const t=findTrade(id);t.exits=t.exits.filter(x=>x.id!==el.dataset.eid);t.u=Date.now();await saveVault();detailSheet(id);renderMain();}break;
       case 'detail':detailSheet(id);break;
       case 'edit':tradeSheet(id);break;
-      case 'deltrade':if(confirm('Delete this trade and all its buys and exits? This cannot be undone.')){DB.trades=DB.trades.filter(t=>t.id!==id);await saveVault();closeSheet();renderMain();toast('Trade deleted');}break;
+      case 'deltrade':if(confirm('Delete this trade and all its buys and exits? This cannot be undone.')){DB.trades=DB.trades.filter(t=>t.id!==id);DB.deleted[id]=Date.now();await saveVault();closeSheet();renderMain();toast('Trade deleted');}break;
       case 'closesheet':closeSheet();break;
       case 'pick':{const c=f._sugg(+el.dataset.i);if(c)f._choose(c,el.dataset.x);break;}
       case 'unpick':f._unpick();break;
@@ -1292,8 +1544,24 @@ document.addEventListener('click',async e=>{
         },'Change PIN');break;
       case 'forgot':if(prompt('This erases the trade book on this phone so you can restore a backup. Type ERASE to continue.')==='ERASE'){localStorage.removeItem(VAULT);localStorage.removeItem(FAILS);render();}break;
       case 'erase':if(prompt('This deletes every trade on this phone. Type ERASE to confirm.')==='ERASE'){localStorage.removeItem(VAULT);localStorage.removeItem(FAILS);DB=null;KEY=null;lock();}break;
-      case 'resetcharges':DB.settings.brokers[el.dataset.b].charges={...(el.dataset.b==='groww'?GROWW_CHARGES:ZERODHA_CHARGES)};await saveVault();renderMain();toast(BROKERS[el.dataset.b]+' charges reset');break;
+      case 'resetcharges':DB.settings.brokers[el.dataset.b].charges={...(el.dataset.b==='groww'?GROWW_CHARGES:ZERODHA_CHARGES)};DB.meta.settingsAt=Date.now();await saveVault();renderMain();toast(BROKERS[el.dataset.b]+' charges reset');break;
       case 'testfeed':await testFeed();break;
+      case 'syncmode':{
+        syncMode=el.dataset.v;
+        $$('[data-act=syncmode]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.v===syncMode)));
+        const w2=$('#sy-pass2w');if(w2)w2.hidden=(syncMode!=='first');
+        const sb=$('[data-act=syncconnect]');if(sb)sb.textContent=syncMode==='first'?'Start sync':'Connect this device';
+        break;}
+      case 'syncconnect':await syncConnect(el);break;
+      case 'syncnow':await syncNow(true);break;
+      case 'synctoken':{
+        const v=($('#sy-newtoken').value||'').trim();
+        if(v.length<20){toast('Paste the new token first.');break;}
+        DB.settings.sync.token=v;DB.settings.sync.err='';await saveVault(true);await syncNow(true);break;}
+      case 'syncoff':
+        if(confirm('Turn off sync on this device? Your trades stay here and the copy on GitHub is not touched.')){DB.settings.sync={on:false};lastCanon='';await saveVault(true);renderMain();toast('Sync is off on this device.');}
+        break;
+      case 'joinreplace':case 'joinmerge':{const r=joinResolve;joinResolve=null;closeSheet();if(r)r(a==='joinreplace'?'replace':'merge');break;}
       case 'notif':
         if(!('Notification' in window)){toast('This browser does not support notifications.');break;}
         toast((await Notification.requestPermission())==='granted'?'Notifications are on.':'Notifications were not allowed.');break;
@@ -1311,22 +1579,24 @@ document.addEventListener('change',async e=>{
     const path=el.dataset.set,S=DB.settings;let v=el.value;
     if(el.dataset.type==='num'){v=num(v);if(path==='capital'&&el.value.trim()==='')v=0;if(!(v>=0)){toast('Enter a valid number.');renderMain();return;}}
     const parts=path.split('.');let o=S;while(parts.length>1)o=o[parts.shift()];o[parts[0]]=v;
+    if(/^(capital|riskPerTrade|nearPct|defaultBroker|brokers\.)/.test(path))DB.meta.settingsAt=Date.now();
     await saveVault();
     if(path==='source'||path==='defaultBroker') renderMain();
   }else if(el.dataset.tags){
     const list=[...new Set(el.value.split(',').map(s=>s.trim()).filter(Boolean))];
     if(!list.length){toast('Keep at least one tag.');renderMain();return;}
-    DB.tags[el.dataset.tags]=list;await saveVault();toast('Tags saved');
+    DB.tags[el.dataset.tags]=list;DB.meta.tagsAt=Date.now();await saveVault();toast('Tags saved');
   }
 });
 document.addEventListener('input',e=>{if(e.target.id==='bq'){bookF.q=e.target.value;$('#booklist').innerHTML=bookList();}});
 document.addEventListener('visibilitychange',()=>{
   if(document.hidden){hiddenAt=Date.now();return;}
   if(DB&&hiddenAt&&Date.now()-hiddenAt>=DB.settings.autoLock*1000){hiddenAt=0;lock();return;}
-  hiddenAt=0;if(DB){refreshPrices();updateFeed();}
+  hiddenAt=0;if(DB){refreshPrices();updateFeed();syncNow();}
 });
 setInterval(()=>{if(DB&&!document.hidden&&marketOpen())refreshPrices();},30000);
 setInterval(()=>{if(DB&&!document.hidden)updateFeed();},5000);
+setInterval(()=>{if(syncOn()&&!document.hidden)syncNow();},120000);
 if('serviceWorker' in navigator&&/^https?:$/.test(location.protocol)){
   navigator.serviceWorker.register('sw.js').catch(()=>{});
   let had=!!navigator.serviceWorker.controller;
