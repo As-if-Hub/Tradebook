@@ -1,6 +1,6 @@
 // Trade Book service worker: keeps the app working offline. It never touches price requests.
-const V = 'tradebook-v1';
-const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
+const V = 'tradebook-v2';
+const SHELL = ['./', 'index.html', 'companies.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
